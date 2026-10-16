@@ -1,0 +1,172 @@
+name: Build OBS-TextPPT
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run tests
+        type: boolean
+        default: true
+      platform:
+        description: Build platform
+        type: choice
+        options: [all, windows, macos]
+        default: all
+      runtime_suite:
+        description: macOS runtime checks
+        type: choice
+        options: [all, studio, studio-click, progressive, focused, stress, layout]
+        default: all
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  parser:
+    name: Text parser tests
+    if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cmake -S . -B build-tests -DBUILD_PARSER_TESTS_ONLY=ON
+      - run: cmake --build build-tests
+      - run: ctest --test-dir build-tests --output-on-failure
+      - name: Ensure local instructions are not tracked
+        run: |
+          if git ls-files | grep -iE '(^|/)agents?\.md$'; then
+            echo "Local development instructions must not be published."
+            exit 1
+          fi
+  windows:
+    name: Windows x64 / OBS 32 / Qt 6.8.3
+    needs: parser
+    if: ${{ !cancelled() && (needs.parser.result == 'success' || needs.parser.result == 'skipped') && (github.event_name != 'workflow_dispatch' || inputs.platform != 'macos') }}
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps
+          key: obs32-windows-${{ hashFiles('buildspec.json', 'cmake/common/buildspec_common.cmake') }}
+          restore-keys: obs32-windows-
+      - name: Clean dist before building
+        run: |
+          $root = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $dist = [IO.Path]::GetFullPath((Join-Path $root 'dist'))
+          if ([IO.Path]::GetDirectoryName($dist) -ne $root) { throw 'Unsafe dist path' }
+          if (Test-Path -LiteralPath $dist) {
+            if ((Get-Item -LiteralPath $dist).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+              throw 'dist must be a normal directory'
+            }
+            Remove-Item -LiteralPath $dist -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $dist | Out-Null
+      - name: Configure
+        run: cmake --preset windows-x64 -DBUILD_DOCK_TESTS=ON -DBUILD_OBS_TEST_PROBE=${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+      - name: Build
+        run: cmake --build --preset windows-x64 --config Release --parallel
+      - name: Install and package
+        run: |
+          cmake --install build_x64 --config Release --prefix release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = (Get-Content buildspec.json -Raw | ConvertFrom-Json).version
+          $package = "dist/OBS-TextPPT-$version-windows-x64.zip"
+          Compress-Archive -Path release/obs-textppt,release/install_obs-textppt.bat -DestinationPath $package
+          Get-FileHash $package -Algorithm SHA256 |
+            Format-List | Out-File dist/SHA256.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: OBS-TextPPT-Windows-x64
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        with:
+          name: OBS-TextPPT-UI-Probe
+          path: |
+            build_x64/tests/Release/textppt-ui-probe.dll
+            build_x64/tests/Release/text-layout-tests.exe
+          retention-days: 1
+          if-no-files-found: error
+      - name: Test Dock and enabled checks
+        run: |
+          $qtCore = Get-ChildItem .deps -Recurse -File -Filter Qt6Core.dll | Select-Object -First 1
+          if (-not $qtCore) { throw 'Qt runtime not found' }
+          $runtimeDirs = @($qtCore.Directory.FullName) + @(Get-ChildItem .deps -Directory | ForEach-Object {
+            $bin = Join-Path $_.FullName 'bin'
+            if (Test-Path -LiteralPath $bin) { $bin }
+          })
+          $env:PATH = ($runtimeDirs -join ';') + ';' + $env:PATH
+          $env:QT_PLUGIN_PATH = Join-Path $qtCore.Directory.Parent.FullName 'plugins'
+          Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public static class TestErrorMode { [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode); }'
+          $null = [TestErrorMode]::SetErrorMode(32771)
+          Write-Output "Qt runtime: $($qtCore.Directory.FullName)"
+          ctest --test-dir build_x64 -C Release --output-on-failure -V
+      - name: Test Windows installer upgrade
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        run: ./tests/installers/windows.ps1
+  macos:
+    name: macOS arm64 / OBS 32 / Qt 6.8.3
+    needs: parser
+    if: ${{ !cancelled() && (needs.parser.result == 'success' || needs.parser.result == 'skipped') && (github.event_name != 'workflow_dispatch' || inputs.platform != 'windows') }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .deps
+          key: obs32-macos-arm64-${{ hashFiles('buildspec.json', 'cmake/common/buildspec_common.cmake', 'cmake/macos/obs-sdk.cmake') }}
+          restore-keys: obs32-macos-arm64-
+      - name: Prepare arm64 build
+        run: |
+          test "$(uname -m)" = arm64
+          cmake -E rm -rf dist
+          cmake -E make_directory dist
+      - name: Configure
+        run: cmake --preset macos-ci -DENABLE_CCACHE=OFF -DBUILD_DOCK_TESTS=ON -DBUILD_OBS_TEST_PROBE=${{ github.event_name != 'workflow_dispatch' || inputs.run_tests }}
+      - name: Build
+        run: cmake --build --preset macos-ci --config Release --parallel
+      - name: Test Dock and enabled checks
+        run: |
+          qt_core=$(find "$PWD/.deps" -path '*/QtCore.framework/Versions/A/QtCore' -type f -print -quit)
+          qt_platform=$(find "$PWD/.deps" -name libqoffscreen.dylib -type f -print -quit)
+          test -n "$qt_core" && test -n "$qt_platform"
+          export DYLD_FRAMEWORK_PATH="${qt_core%/QtCore.framework/Versions/A/QtCore}"
+          export DYLD_LIBRARY_PATH="$(find "$PWD/.deps" -maxdepth 2 -type d -name lib -print | paste -sd: -)"
+          export QT_PLUGIN_PATH="$(dirname "$(dirname "$qt_platform")")"
+          ctest --test-dir build_macos -C Release --output-on-failure -V
+      - name: Install and package
+        run: |
+          cmake --install build_macos --config Release --prefix "$PWD/release"
+          test "$(lipo -archs release/obs-textppt.plugin/Contents/MacOS/obs-textppt)" = arm64
+          version=$(python3 -c 'import json; print(json.load(open("buildspec.json"))["version"])')
+          package="OBS-TextPPT-$version-macos-arm64.zip"
+          cd release
+          zip -r "../dist/$package" obs-textppt.plugin install_obs-textppt.sh
+          cd ../dist
+          shasum -a 256 "$package" > SHA256.txt
+      - name: Test macOS installer upgrade
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        run: bash tests/installers/macos.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: OBS-TextPPT-macOS-arm64
+          path: dist/*
+          if-no-files-found: error
+      - name: Test fonts, line reveal and stress in OBS
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        timeout-minutes: 35
+        run: python3 tests/obs/run-macos.py --suite "${{ inputs.runtime_suite || 'all' }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_tests)
+        with:
+          name: OBS-TextPPT-macOS-runtime-checks
+          path: runtime-reports/
+          retention-days: 1
+          if-no-files-found: warn

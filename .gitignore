@@ -1,0 +1,14 @@
+/.build-support/
+/.deps/
+/build*/
+/release/
+/runtime-reports/
+/output/
+/dist/
+/.ccache/
+/src/plugin-macros.generated.h
+/CMakeUserPresets.json
+*.user
+.DS_Store
+__pycache__/
+*.py[cod]
